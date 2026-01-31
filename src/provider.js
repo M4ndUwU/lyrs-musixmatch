@@ -95,8 +95,8 @@ export class MusixMatchLyricProvider {
     this.targetLanguage = "ko";
     this._config = _config;
     this.getShowKoreanPronunciation = typeof getShowKoreanPronunciation === 'function' ? getShowKoreanPronunciation : () => true;
-    this.getExtractOriginalTrack = typeof getExtractOriginalTrack === 'function' ? getExtractOriginalTrack : () => false;
-    this.getUseTranslationWhenNoKorean = typeof getUseTranslationWhenNoKorean === 'function' ? getUseTranslationWhenNoKorean : () => true;
+    this.getExtractOriginalTrack = typeof getExtractOriginalTrack === 'function' ? getExtractOriginalTrack : () => true;
+    this.getUseTranslationWhenNoKorean = typeof getUseTranslationWhenNoKorean === 'function' ? getUseTranslationWhenNoKorean : () => false;
     this.getConfig = () => ({
       showKoreanPronunciation: this.getShowKoreanPronunciation(),
       extractOriginalTrack: this.getExtractOriginalTrack(),
