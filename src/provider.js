@@ -5,85 +5,71 @@ import { hangulize } from './hangulize/index.js';
 const cookieFetch = makeCookieFetch(fetch);
 const cacheTable = {};
 const TRANSLATION_CACHE_MAX = 500;
+
 const translationCache = {}; // ja -> ko 캐시 (번역 API 호출 절감)
 const translationCacheOrder = []; // LRU용
 
-// 커버/歌ってみた 등 문구 제거 후 원곡 제목·아티스트 추출 (다양한 표기 대응)
-const LEADING_COVER = /^【?(?:歌ってみた|踊ってみた|演奏してみた)】?\s*[・\-:]?\s*/i;
-const TRAILING_COVER_PATTERNS = [
-  /\s*／\s*[^／\n]+?\s*【歌ってみた】\s*$/i,
-  /\s*\/\s*Cover\s*:\s*[^/\n]+$/i,
-  /\s*[┃｜]\s*Cover\s+by\s+[^\n]+$/i,
-  /\s*\/\s*Cover\s+by\s+[^/\n]+$/i,
-  /\s+Cover\s+by\s+[^\n]+$/i,
-  /\s*\/\s*covered\s+by\s+[^/\n]+$/i,
-  /\s+covered\s+by\s+[^\n]+$/i,
-  /\s*【[^】]*\/[^】]*】\s*$/,  // 【レイン・パターソン/にじさんじ】 등
-  /\s*【歌ってみた】\s*$/i,
+const COVER_KEYWORDS = [
+  '歌ってみた', '踊ってみた', '演奏してみた',
+  'covered by', 'Cover by', 'Cover:', 'cover:',
+  'Covered by', 'カバー', 'cover',
 ];
-const PAREN_ARTIST = /^(.+?)[\（\(]([^）\)]+)[\）\)]\s*$/;  // Title（Artist） 또는 Title(Artist)
-const SLASH_SEP = /\s*\/\s*/;   // Artist / Title
-const DASH_SEP = /\s*-\s*/;     // Title - Artist (앞이 제목, 뒤가 아티스트인 경우)
 
-function stripCoverMarkers(str) {
-  if (!str || typeof str !== 'string') return '';
-  let s = str.trim();
-  s = s.replace(LEADING_COVER, '');
-  for (const p of TRAILING_COVER_PATTERNS) {
-    s = s.replace(p, '');
-  }
-  return s.replace(/\s+/g, ' ').trim();
+function hasCoverKeyword(title, artist) {
+  const raw = [title || '', artist || ''].join(' ');
+  return COVER_KEYWORDS.some((kw) => raw.includes(kw));
 }
 
-function extractOriginalTrack(title, artist) {
-  if (!title && !artist) return { title: '', artist: '' };
-  let t = stripCoverMarkers(title || '');
-  let a = stripCoverMarkers(artist || '');
-  if (!t && !a) return { title: title || '', artist: artist || '' };
+/** 【歌ってみた】로 시작하는 제목만 처리. 5가지 패턴에 맞춰 제목/원곡 아티스트 추출 */
+function extractOriginalTrackRuleBased(title, artist) {
+  const raw = String(title || '').trim();
+  if (!raw.startsWith('【歌ってみた】')) {
+    return { title: raw, artist: '' };
+  }
+  let s = raw.replace(/^【歌ってみた】/, '').trim();
+  // 끝의 【...】 블록 제거 (예: 【レイン・パターソン/にじさんじ】, 【covered by 花宮莉歌】)
+  s = s.replace(/\s*【[^】]*】\s*$/g, '').trim();
+  // 끝의 " covered by X" 제거 (예: covered by 明透, covered by 幸祜&HACHI, covered by ヰ世界情緒)
+  s = s.replace(/\s+covered\s+by\s+.+$/i, '').trim();
+  // 끝의 공백+슬래시 제거 (예: "君の知らない物語 /" → "君の知らない物語")
+  s = s.replace(/\s*[\/／\uFF0F\u2044\u2215]\s*$/g, '').trim();
+  s = s.replace(/\u3000/g, ' ').replace(/\s+/g, ' ').trim();
 
-  const combined = [t, a].filter(Boolean).join(' / ');
-  const stripped = stripCoverMarkers(combined);
-  if (!stripped) return { title: t || title, artist: a || artist };
-
-  let outTitle = '';
+  let outTitle = s;
   let outArtist = '';
+  const inputArtist = typeof artist === 'string' ? artist.trim() : '';
 
-  const parts = stripped.split(SLASH_SEP).map(s => s.trim()).filter(Boolean);
-  if (parts.length >= 2) {
-    const left = parts[0];
-    const right = parts.slice(1).join(' / ');
-    const matchLeft = left.match(PAREN_ARTIST);
-    if (matchLeft) {
-      outTitle = matchLeft[1].trim();
-      outArtist = matchLeft[2].trim();
-    } else if (/[\（\(]/.test(right) && left.length <= 20 && !/[\（\(]/.test(left)) {
-      outTitle = right;
-      outArtist = left;
+  if (s.includes(' / ')) {
+    const parts = s.split(' / ').map((p) => p.trim());
+    const left = parts[0] || '';
+    const right = parts[1] || '';
+    if (right) {
+      // right가 "covered by" 포함이거나, 트랙 아티스트가 있으면 right는 커버 아티스트로 간주
+      if (/covered\s*by/i.test(right) || inputArtist) {
+        outTitle = left;
+        outArtist = ''; // 커버 아티스트로 판단, 비움
+      } else {
+        outTitle = left;
+        outArtist = right;
+      }
     } else {
       outTitle = left;
-      outArtist = right;
+      outArtist = '';
     }
-  } else {
-    const single = parts[0] || stripped;
-    const match = single.match(PAREN_ARTIST);
-    if (match) {
-      outTitle = match[1].trim();
-      outArtist = match[2].trim();
+  } else if (s.includes(' - ')) {
+    const parts = s.split(' - ').map((p) => p.trim());
+    const left = parts[0] || '';
+    const right = parts.slice(1).join(' - ').trim() || '';
+    if (left && right) {
+      outTitle = left;
+      outArtist = right;
     } else {
-      const dashParts = single.split(DASH_SEP).map(s => s.trim()).filter(Boolean);
-      if (dashParts.length >= 2) {
-        outTitle = dashParts[0];
-        outArtist = dashParts[1];
-      } else {
-        outTitle = single;
-        outArtist = a || '';
-      }
+      outTitle = left || s;
+      outArtist = '';
     }
   }
 
-  if (!outTitle) outTitle = t || title || '';
-  if (!outArtist) outArtist = a || artist || '';
-  return { title: outTitle.replace(/\s+/g, ' ').trim(), artist: outArtist.replace(/\s+/g, ' ').trim() };
+  return { title: outTitle.trim(), artist: (outArtist || '').trim() };
 }
 
 const LyricResponseSchema = z.object({
@@ -109,7 +95,7 @@ export class MusixMatchLyricProvider {
     this.targetLanguage = "ko";
     this._config = _config;
     this.getShowKoreanPronunciation = typeof getShowKoreanPronunciation === 'function' ? getShowKoreanPronunciation : () => true;
-    this.getExtractOriginalTrack = typeof getExtractOriginalTrack === 'function' ? getExtractOriginalTrack : () => true;
+    this.getExtractOriginalTrack = typeof getExtractOriginalTrack === 'function' ? getExtractOriginalTrack : () => false;
     this.getUseTranslationWhenNoKorean = typeof getUseTranslationWhenNoKorean === 'function' ? getUseTranslationWhenNoKorean : () => true;
     this.getConfig = () => ({
       showKoreanPronunciation: this.getShowKoreanPronunciation(),
@@ -219,13 +205,19 @@ export class MusixMatchLyricProvider {
 
   async getLyric(params) {
     if (params.page && params.page > 1) return null;
+    const title = params.title ?? params.titile ?? params.trackTitle ?? "";
+    const artist = params.artist ?? params.aritist ?? params.channelName ?? "";
     const cfg = this.getConfig();
-    const useExtract = cfg.extractOriginalTrack !== false;
-    const extracted = useExtract ? extractOriginalTrack(params.title || "", params.artist || "") : { title: params.title || "", artist: params.artist || "" };
-    const searchTitle = extracted.title || params.title || "";
-    const searchArtist = extracted.artist || params.artist || "";
-    if (useExtract && (searchTitle !== (params.title || "") || searchArtist !== (params.artist || ""))) {
-      this.logger.info("[Lyrs] [MusixMatch] Extracted original track for search", { original: params, extracted: { title: searchTitle, artist: searchArtist } });
+    const useExtract = cfg.extractOriginalTrack === true;
+    const shouldExtract = useExtract && (title || '').startsWith('【歌ってみた】');
+    const extracted = shouldExtract
+      ? extractOriginalTrackRuleBased(title, artist)
+      : { title, artist };
+    const searchTitle = extracted.title || title;
+    // 추출 시 아티스트를 비웠으면 빈 문자열 유지 (원래 artist로 대체하지 않음)
+    const searchArtist = shouldExtract ? extracted.artist : artist;
+    if (shouldExtract && (searchTitle !== title || searchArtist !== artist)) {
+      this.logger.info("[Lyrs] [MusixMatch] Rule-based extracted original track for search", { original: { title, artist }, extracted: { title: searchTitle, artist: searchArtist } });
     }
     const cacheKey = [params.page, searchTitle, searchArtist].filter(Boolean).join('|');
     if (cacheTable[cacheKey]) {
@@ -306,8 +298,9 @@ export class MusixMatchLyricProvider {
 
   async getIsrc(title, artist) {
     // https://www.shazam.com/services/amapi/v1/catalog/KR/search?types=songs&term=yorushika&limit=3
+    const term = [artist, title].filter((s) => s != null && String(s).trim()).join(' ').trim() || (title || '').trim();
     const query = new URLSearchParams();
-    query.set('term', artist + ' ' + title);
+    query.set('term', term);
     query.set('types', 'songs');
     query.set('limit', '1');
     const response = await fetch(`https://www.shazam.com/services/amapi/v1/catalog/KR/search?${query.toString()}`);
